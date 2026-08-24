@@ -1,0 +1,33 @@
+name: Experiment result
+description: Report a controlled AELIA experiment or ablation
+title: "[experiment] "
+labels: [experiment]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis
+      description: Which decision gate or architectural claim was tested?
+    validations:
+      required: true
+  - type: textarea
+    id: configs
+    attributes:
+      label: Compared configurations
+      description: Include exact configs, commits, seeds, data, and tokenizer.
+    validations:
+      required: true
+  - type: textarea
+    id: compute
+    attributes:
+      label: All-in compute accounting
+      description: Include training FLOPs, target cost, branch cost, and matching error.
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Report LM quality, predictive metrics, confidence intervals, and failure flags.
+    validations:
+      required: true

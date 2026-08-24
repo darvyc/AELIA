@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "AELIA: Adaptive Ellipsoidal Latent Inference Architecture"
+message: "If you use AELIA, cite the repository commit and the exact experiment configuration."
+type: software
+authors:
+  - family-names: "Contributors"
+    given-names: "AELIA"
+version: 0.1.0
+license: Apache-2.0
+keywords:
+  - autoregressive language modeling
+  - conditional density estimation
+  - recurrent memory
+  - Gaussian mixtures
+  - characteristic functions

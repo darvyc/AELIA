@@ -1,0 +1,33 @@
+experiment: aelia_second_stage
+purpose: conditional scale-up after first-stage decision gates pass
+
+model:
+  layers: 32
+  residual_width: 4096
+  recurrent_layers: 26
+  exact_attention_layers: 6
+  predictive_layers: 8
+  mixture_modes_max: 6
+  target_dim: 320
+  covariance: diag_lowrank
+  covariance_rank: 4
+  covariance_basis_rank: 24
+  characteristic_features: 96
+  mtp_horizon: 4
+
+predictive:
+  mode_routing: softmax_then_sparse_ablation
+  adaptive_activity_target: [0.25, 0.50]
+  feedback_gradient_scale: 0.0
+  enable_low_rank_only_if_ablation_passes: true
+  enable_sparse_modes_only_if_ablation_passes: true
+  enable_adaptive_compute_only_if_ablation_passes: true
+
+future_target:
+  probability_geometry: hellinger_countsketch
+  whitening: shrinkage_frozen
+  branch_supervision_fraction: [0.02, 0.10]
+
+compute:
+  match_all_in_flops: true
+  report_online_and_all_in: true

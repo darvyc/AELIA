@@ -1,0 +1,32 @@
+name: Bug report
+description: Report a reproducible implementation defect
+title: "[bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and what behavior did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest code or command that reproduces the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python, PyTorch, accelerator, operating system, precision mode.
+    validations:
+      required: true
+  - type: textarea
+    id: invariant
+    attributes:
+      label: Mathematical or architectural invariant affected
+      description: If known, identify the relevant invariant or specification section.

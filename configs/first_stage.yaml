@@ -1,0 +1,45 @@
+experiment: aelia_first_stage
+purpose: smallest decisive probabilistic-structure experiment
+
+model:
+  layers: 24
+  residual_width: 2048
+  recurrent_layers: 20
+  exact_attention_layers: 4
+  predictive_layers: 4
+  recurrent_heads: 16
+  d_key: 128
+  d_value: 128
+  mixture_modes: 4
+  target_dim: 192
+  covariance: diagonal
+  characteristic_features: 48
+  mtp_horizon: 4
+
+predictive:
+  mode_routing: softmax
+  predictive_token_activity: 1.0
+  feedback_gradient_scale: 0.0
+  low_rank_covariance: false
+  adaptive_compute: false
+  overlap_regularization: false
+
+future_target:
+  horizons: [1, 2, 3, 4, 5, 6, 7]
+  scales:
+    - [1]
+    - [2, 3]
+    - [4, 5, 6, 7]
+  probability_geometry: hellinger_countsketch
+  whitening: shrinkage_frozen
+  teacher: frozen_checkpoint
+
+controls:
+  hybrid_plus_mtp: true
+  same_supervision_deterministic_embedding: true
+  k1_density: true
+  no_feedback: true
+
+compute:
+  match_all_in_flops: true
+  match_tolerance_fraction: 0.02
