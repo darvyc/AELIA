@@ -247,3 +247,24 @@ Automatically flag sustained windows of:
 ## 12. Decision gate
 
 No mechanism advances because it is mathematically interesting. It advances only when the corresponding matched experiment clears its quality, compute, calibration, and statistical thresholds.
+
+
+## Recurrent execution measurement
+
+`scripts/benchmark_recurrent.py` measures the batched projection sequence
+operator against repeated calls to the same module's `step` operator.
+Both paths include normalization, projections, recurrence and residual output.
+Output and final-state agreement are checked before timing.
+
+Observed CPU measurement (PyTorch 2.14.0+cpu, float32, one thread,
+batch 4, sequence 128, model width 128, four heads, key/value width 16):
+
+| Execution | Median latency | Tokens/s |
+| --- | ---: | ---: |
+| Batched projection sequence | 8.439 ms | 60,668 |
+| Repeated single-token step | 22.742 ms | 22,513 |
+
+The latency ratio is 2.695. Measurements use `torch.utils.benchmark.Timer`
+with at least one second of autorange per path and inference without gradients.
+This is a local operator measurement, not a GPU, training, full-model or
+language-quality result. Hardware and sequence shape affect the ratio.

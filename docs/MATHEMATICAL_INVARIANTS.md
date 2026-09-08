@@ -20,7 +20,7 @@ With normalized key `k_t`, scalar `beta_t` in `[0, 1]`, and channel decay `D_t` 
 
 ```text
 A_t = I - beta_t k_t k_t^T
-||A_t||_2 = 1
+||A_t||_2 <= 1
 ||A_t D_t||_2 <= alpha_max < 1
 ```
 
@@ -100,7 +100,18 @@ delta^T Sigma^(-1) delta
     - a^T M^(-1) a
 ```
 
-The subtraction is essential.
+A stable equivalent evaluates a sum of nonnegative terms. With `b = M^(-1) a`:
+
+```text
+r = delta - U b
+quad = sum_j r_j^2 / D_jj + sum_l b_l^2
+```
+
+Expanding gives `delta^T D^(-1) delta - 2 b^T a + b^T M b`.
+Since `M b = a`, this is exactly the Woodbury quadratic. Cholesky
+factorization solves the rank-sized system without a matrix inverse.
+Density arithmetic uses at least float32, with float64 preserved for
+high-precision evaluation and gradient checks.
 
 The determinant is:
 
@@ -214,3 +225,54 @@ The default decisive experiment uses `eta = 0` so the density parameters are tra
 ## 10. Same-supervision control
 
 A probabilistic gain is interpretable only when the deterministic control receives the same future information. The matched control predicts the same teacher distribution embedding, uses the same feedback width and residual insertion points, and is matched on parameters and measured all-in training FLOPs.
+
+
+## 11. Exact projected mixture uncertainty
+
+For normalized weights `w_k`, means `mu_k`, and covariances
+`Sigma_k = diag(d_k) + U_k U_k^T`, the law of total covariance gives:
+
+```text
+mu = sum_k w_k mu_k
+Cov(Z) = sum_k w_k [Sigma_k + (mu_k - mu)(mu_k - mu)^T]
+```
+
+For each projection row `p`, compute:
+
+```text
+m_k = p mu_k
+m = sum_k w_k m_k
+v_k = sum_j p_j^2 d_kj + ||p U_k||_2^2
+Var(p Z) = sum_k w_k [v_k + (m_k - m)^2]
+```
+
+This includes both within-component correlation and between-component
+correlation without constructing a target_dim by target_dim covariance.
+For J projection rows, K modes, target dimension D and rank R, work is
+O(J K D (1 + R)); the projected low-rank temporary has J K R elements
+per input position. Diagonal mixture variance also uses centered means
+to avoid cancellation from subtracting squared large means.
+
+## 12. Causal batched recurrent execution
+
+All q, k, v, alpha and beta projections depend only on the input at their
+own position, so their linear maps operate across batch and time together.
+The memory recurrence remains sequential:
+
+```text
+S_bar,t = diag(alpha_t) S_(t-1)
+e_t = v_t - S_bar,t^T k_t
+S_t = S_bar,t + beta_t k_t e_t^T
+o_t = S_t^T q_t
+```
+
+Output projection and residual gates operate on stacked reads. A document
+reset zeros memory before its token's recurrence. Nonzero initial states,
+input gradients, parameter gradients and final states follow the same
+single-token equations. Empty sequences preserve the initial state.
+
+The arithmetic order of batched matrix multiplication can affect rounding.
+Projected activations require O(B T H (3 D_key + D_value + 1)) storage;
+the recurrent state occupies O(B H D_key D_value). This implementation
+trades projected activation storage for fewer small projection launches.
+It does not implement a parallel scan or a fused GPU recurrence.

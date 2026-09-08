@@ -38,9 +38,7 @@ class DistributionSummary(nn.Module):
     def forward(self, params: MixtureParams) -> torch.Tensor:
         phi = self.predictor.characteristic(params)
         mean, var_diag = self.predictor.first_two_moments(params)
-        p = self.moment_projection.to(mean.dtype)
-        mean_proj = torch.einsum("rd,...d->...r", p, mean)
-        var_proj = torch.einsum("rd,...d->...r", p.square(), var_diag)
+        mean_proj, var_proj = self.predictor.projected_moments(params, self.moment_projection)
         u_total = var_diag.mean(dim=-1, keepdim=True)
         d_eff = var_diag.sum(dim=-1, keepdim=True).square() / (var_diag.square().sum(dim=-1, keepdim=True) + 1e-6)
         return torch.cat([phi.real.to(mean.dtype), phi.imag.to(mean.dtype), mean_proj, var_proj, u_total, d_eff], dim=-1)
@@ -70,3 +68,4 @@ class PredictiveFeedback(nn.Module):
         gate = torch.sigmoid(self.gate(self.hidden_norm(h)))
         gamma = self.gamma_max * torch.sigmoid(self.logit_strength)
         return h + gamma * gate * d
+

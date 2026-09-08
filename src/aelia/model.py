@@ -132,7 +132,7 @@ class AELIALM(nn.Module):
             recurrent_states = [None] * len(self.blocks)
         new_states: list[RecurrentState | None] = []
         predictive: list[PredictiveOutput] = []
-        for i, (kind, block, state) in enumerate(zip(self.config.layers, self.blocks, recurrent_states)):
+        for i, (kind, block, state) in enumerate(zip(self.config.layers, self.blocks, recurrent_states, strict=True)):
             if kind == "R":
                 x, state = block(x, state, reset_mask)
                 new_states.append(state)
@@ -145,3 +145,4 @@ class AELIALM(nn.Module):
                 new_states.append(None)
         h = self.final_norm(x)
         return AELIAOutput(self.lm_head(h), h, predictive, new_states)
+

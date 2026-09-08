@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -111,3 +111,4 @@ class ModelConfig:
     @property
     def predictive_layers(self) -> int:
         return sum(x == "P" for x in self.layers)
+

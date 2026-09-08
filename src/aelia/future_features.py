@@ -79,7 +79,7 @@ class MultiscaleFutureProjector(nn.Module):
         self.scales = [tuple(int(i) for i in scale) for scale in scales]
         self.output_dims = list(output_dims)
         gen = torch.Generator().manual_seed(seed)
-        for i, (scale, out_dim, tau) in enumerate(zip(self.scales, output_dims, temporal_taus)):
+        for i, (scale, out_dim, tau) in enumerate(zip(self.scales, output_dims, temporal_taus, strict=True)):
             if not scale:
                 raise ValueError("scales must be non-empty")
             if out_dim < 1:
@@ -110,3 +110,4 @@ class MultiscaleFutureProjector(nn.Module):
             flattened = selected.flatten(-2)
             outputs.append(torch.einsum("od,...d->...o", projection, flattened))
         return torch.cat(outputs, dim=-1)
+

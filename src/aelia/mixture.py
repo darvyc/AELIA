@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -96,34 +96,40 @@ class GaussianMixturePredictor(nn.Module):
 
     def component_log_prob(self, z: torch.Tensor, params: MixtureParams) -> torch.Tensor:
         """Return component log densities with shape [..., K]."""
-        cfg = self.config
-        delta = z.unsqueeze(-2) - params.means
-        d_inv = params.diag_var.reciprocal()
-        quad_diag = (delta.square() * d_inv).sum(dim=-1)
-        logdet_diag = params.diag_var.log().sum(dim=-1)
-        if params.lowrank is None:
-            quad = quad_diag
-            logdet = logdet_diag
-        else:
-            u = params.lowrank
-            weighted_u = d_inv.unsqueeze(-1) * u
-            m = u.transpose(-1, -2) @ weighted_u
-            eye = torch.eye(cfg.cov_rank, device=z.device, dtype=z.dtype)
-            m = m + eye
-            a = torch.einsum("...dr,...d->...r", weighted_u, delta)
-            chol = torch.linalg.cholesky(m.float()).to(z.dtype)
-            solved = torch.cholesky_solve(a.unsqueeze(-1).float(), chol.float()).squeeze(-1).to(z.dtype)
-            quad = quad_diag - (a * solved).sum(dim=-1)
-            logdet = logdet_diag + 2.0 * torch.diagonal(chol, dim1=-2, dim2=-1).log().sum(dim=-1).to(z.dtype)
-        constant = cfg.target_dim * math.log(2.0 * math.pi)
-        return -0.5 * (constant + logdet + quad)
+        # Density algebra accumulates in at least float32, including under AMP.
+        dtype = torch.promote_types(z.dtype, params.means.dtype)
+        dtype = torch.promote_types(dtype, params.diag_var.dtype)
+        if params.lowrank is not None:
+            dtype = torch.promote_types(dtype, params.lowrank.dtype)
+        if dtype in (torch.float16, torch.bfloat16):
+            dtype = torch.float32
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            delta = z.to(dtype).unsqueeze(-2) - params.means.to(dtype)
+            diag = params.diag_var.to(dtype)
+            logdet = diag.log().sum(dim=-1)
+            if params.lowrank is None:
+                quad = (delta.square() / diag).sum(dim=-1)
+            else:
+                u = params.lowrank.to(dtype)
+                weighted_u = u / diag.unsqueeze(-1)
+                eye = torch.eye(u.shape[-1], device=z.device, dtype=dtype)
+                m = eye + u.transpose(-1, -2) @ weighted_u
+                a = torch.einsum("...dr,...d->...r", weighted_u, delta)
+                chol = torch.linalg.cholesky(m)
+                solution = torch.cholesky_solve(a.unsqueeze(-1), chol).squeeze(-1)
+                # Equivalent to Woodbury without subtracting two large quadratics.
+                residual = delta - (u @ solution.unsqueeze(-1)).squeeze(-1)
+                quad = (residual.square() / diag).sum(dim=-1) + solution.square().sum(dim=-1)
+                logdet = logdet + 2.0 * torch.diagonal(chol, dim1=-2, dim2=-1).log().sum(dim=-1)
+            constant = self.config.target_dim * math.log(2.0 * math.pi)
+            return -0.5 * (constant + logdet + quad)
 
     def log_prob(self, z: torch.Tensor, params: MixtureParams | None = None) -> torch.Tensor:
         if params is None:
             raise ValueError("params are required; call predictor(h) first")
         comp = self.component_log_prob(z, params)
         weighted = torch.log(params.weights.clamp_min(self.config.eps)) + comp
-        return torch.logsumexp(weighted.float(), dim=-1).to(z.dtype)
+        return torch.logsumexp(weighted, dim=-1)
 
     def nll(self, z: torch.Tensor, params: MixtureParams, normalize_dim: bool = True) -> torch.Tensor:
         loss = -self.log_prob(z, params)
@@ -134,7 +140,7 @@ class GaussianMixturePredictor(nn.Module):
     def responsibilities(self, z: torch.Tensor, params: MixtureParams) -> torch.Tensor:
         comp = self.component_log_prob(z, params)
         ell = torch.log(params.weights.clamp_min(self.config.eps)) + comp
-        return torch.softmax(ell.float(), dim=-1).to(z.dtype)
+        return torch.softmax(ell, dim=-1)
 
     def characteristic(self, params: MixtureParams) -> torch.Tensor:
         """Complex-valued characteristic function evaluated at fixed frequencies.
@@ -160,6 +166,22 @@ class GaussianMixturePredictor(nn.Module):
         within_diag = params.diag_var
         if params.lowrank is not None:
             within_diag = within_diag + params.lowrank.square().sum(dim=-1)
-        second_diag = (w * (within_diag + params.means.square())).sum(dim=-2)
-        total_var_diag = second_diag - mean.square()
-        return mean, total_var_diag.clamp_min(0.0)
+        centered = params.means - mean.unsqueeze(-2)
+        total_var_diag = (w * (within_diag + centered.square())).sum(dim=-2)
+        return mean, total_var_diag
+
+    def projected_moments(
+        self, params: MixtureParams, projection: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mean and variance of each row projection, including cross covariance."""
+        p = projection.to(params.means)
+        component_mean = torch.einsum("rd,...kd->...kr", p, params.means)
+        within = torch.einsum("rd,...kd->...kr", p.square(), params.diag_var)
+        if params.lowrank is not None:
+            projected_u = torch.einsum("rd,...kdc->...krc", p, params.lowrank)
+            within = within + projected_u.square().sum(dim=-1)
+        weights = params.weights.unsqueeze(-1)
+        mean = (weights * component_mean).sum(dim=-2)
+        centered = component_mean - mean.unsqueeze(-2)
+        variance = (weights * (within + centered.square())).sum(dim=-2)
+        return mean, variance

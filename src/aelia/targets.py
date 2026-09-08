@@ -51,7 +51,7 @@ class FrozenWhitening(nn.Module):
         self.register_buffer("transform", transform)
 
     @classmethod
-    def fit(cls, x: torch.Tensor, shrinkage: float = 0.05, eps: float = 1e-5) -> "FrozenWhitening":
+    def fit(cls, x: torch.Tensor, shrinkage: float = 0.05, eps: float = 1e-5) -> FrozenWhitening:
         if x.ndim != 2:
             raise ValueError("calibration x must have shape [samples, dim]")
         mean = x.mean(dim=0)
@@ -66,3 +66,4 @@ class FrozenWhitening(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.einsum("...d,ed->...e", x - self.mean, self.transform)
+

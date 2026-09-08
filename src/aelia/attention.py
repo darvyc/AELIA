@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,3 +53,4 @@ class CausalGroupedQueryAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, dropout_p=c.dropout if self.training else 0.0, is_causal=True)
         y = y.transpose(1, 2).reshape(b, t, c.query_heads * c.head_dim)
         return x + torch.sigmoid(self.residual_scale) * self.o_proj(y)
+

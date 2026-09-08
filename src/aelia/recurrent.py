@@ -43,13 +43,13 @@ class ContractiveDeltaMemory(nn.Module):
     def _project(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
         c = self.config
         z = self.norm(x)
-        q = self.q_proj(z).view(x.shape[0], c.heads, c.d_key)
-        k = self.k_proj(z).view(x.shape[0], c.heads, c.d_key)
-        v = self.v_proj(z).view(x.shape[0], c.heads, c.d_value)
+        q = self.q_proj(z).view(*x.shape[:-1], c.heads, c.d_key)
+        k = self.k_proj(z).view(*x.shape[:-1], c.heads, c.d_key)
+        v = self.v_proj(z).view(*x.shape[:-1], c.heads, c.d_value)
         q = F.normalize(q, dim=-1, eps=c.eps)
         k = F.normalize(k, dim=-1, eps=c.eps)
-        alpha = c.alpha_max * torch.sigmoid(self.alpha_proj(z)).view(x.shape[0], c.heads, c.d_key)
-        beta = torch.sigmoid(self.beta_proj(z)).view(x.shape[0], c.heads, 1)
+        alpha = c.alpha_max * torch.sigmoid(self.alpha_proj(z)).view(*x.shape[:-1], c.heads, c.d_key)
+        beta = torch.sigmoid(self.beta_proj(z)).view(*x.shape[:-1], c.heads, 1)
         return z, q, k, v, alpha, beta
 
     def step(
@@ -90,13 +90,29 @@ class ContractiveDeltaMemory(nn.Module):
         batch, time, _ = x.shape
         if state is None:
             state = self.initial_state(batch, device=x.device, dtype=x.dtype)
-        outputs = []
+        if reset_mask is not None and reset_mask.shape != (batch, time):
+            raise ValueError("reset_mask must have shape [batch, time]")
+        if time == 0:
+            return x, state
+        # All input-dependent projections are independent across time.
+        z, q, k, v, alpha, beta = self._project(x)
+        memory = state.memory
+        reads = []
         for t in range(time):
-            reset = None if reset_mask is None else reset_mask[:, t]
-            y, state = self.step(x[:, t], state, reset=reset)
-            outputs.append(y)
-        return torch.stack(outputs, dim=1), state
+            if reset_mask is not None:
+                keep = (~reset_mask[:, t].bool()).to(memory.dtype).view(batch, 1, 1, 1)
+                memory = memory * keep
+            decayed = alpha[:, t].unsqueeze(-1) * memory
+            old = torch.einsum("bhkv,bhk->bhv", decayed, k[:, t])
+            innovation = v[:, t] - old
+            memory = decayed + (beta[:, t] * k[:, t]).unsqueeze(-1) * innovation.unsqueeze(-2)
+            reads.append(torch.einsum("bhkv,bhk->bhv", memory, q[:, t]))
+        read = torch.stack(reads, dim=1).flatten(-2)
+        gate = torch.sigmoid(self.gate_proj(z))
+        y = x + torch.sigmoid(self.residual_scale) * gate * self.out_proj(read)
+        return y, RecurrentState(memory)
 
     @property
     def contraction_ceiling(self) -> float:
         return self.config.alpha_max
+

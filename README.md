@@ -483,3 +483,24 @@ If you build on the architecture or reference implementation, use the included [
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
+
+
+### Numerical execution
+
+Predictive uncertainty uses exact projected mixture covariance, including
+low-rank and between-mode correlations. Gaussian density evaluation uses
+a Cholesky solve and a nonnegative residual quadratic in at least float32.
+The recurrent operator batches independent projections across time while
+retaining causal state updates and document resets.
+
+The derivations and complexity bounds are in
+[Mathematical invariants](docs/MATHEMATICAL_INVARIANTS.md).
+Run the reproducible recurrent CPU benchmark with:
+
+```bash
+PYTHONPATH=src python scripts/benchmark_recurrent.py
+```
+
+The benchmark checks output and state agreement before timing. Its ratio
+measures one recurrent operator in inference mode; end-to-end training
+speed, GPU throughput and language-model quality require separate measurements.
