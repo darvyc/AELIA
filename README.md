@@ -165,7 +165,11 @@ Posterior responsibilities are:
 r_m = softmax_m(ell)
 ```
 
-The implementation contains a diagonal path and a diagonal-plus-low-rank path using the Woodbury identity and matrix determinant lemma.
+The implementation contains diagonal and diagonal-plus-low-rank paths using the
+Woodbury identity and matrix determinant lemma. A sum-of-squares Mahalanobis form,
+log-space routing, and FP32 or FP64 probability arithmetic preserve numerical
+stability. Boolean observation masks evaluate exact Gaussian marginals when only
+part of a future target is available.
 
 ### 4. Distribution-invariant feedback
 
@@ -223,51 +227,19 @@ The key experiment is therefore whether learning a coherent conditional density 
 
 ## Repository map
 
-```text
-AELIA/
-├── README.md
-├── pyproject.toml
-├── Makefile
-├── LICENSE
-├── CITATION.cff
-├── configs/
-│   ├── first_stage.yaml
-│   └── second_stage.yaml
-├── docs/
-│   ├── SPECIFICATION.md
-│   ├── MATHEMATICAL_INVARIANTS.md
-│   ├── EXPERIMENTS.md
-│   └── IMPLEMENTATION_STATUS.md
-├── examples/
-│   ├── minimal_forward.py
-│   └── predictive_loss.py
-├── scripts/
-│   ├── check_repo.py
-│   └── estimate_memory.py
-├── src/aelia/
-│   ├── adaptive.py
-│   ├── attention.py
-│   ├── config.py
-│   ├── controls.py
-│   ├── diagnostics.py
-│   ├── feedback.py
-│   ├── ffn.py
-│   ├── future_features.py
-│   ├── losses.py
-│   ├── mixture.py
-│   ├── model.py
-│   ├── mtp.py
-│   ├── norm.py
-│   ├── recurrent.py
-│   ├── scoring.py
-│   └── targets.py
-└── tests/
-    ├── test_feedback_control.py
-    ├── test_mixture.py
-    ├── test_model.py
-    ├── test_recurrent.py
-    └── test_targets.py
-```
+| Location | Contents |
+|---|---|
+| `src/aelia/` | Hybrid model, state caches, probability operators, feedback, targets and scoring |
+| `tests/` | Dense numerical references, gradient checks, causality and cache equivalence |
+| `docs/SPECIFICATION.md` | Architecture and training specification |
+| `docs/EXECUTION_MATH.md` | Implemented equations, proofs, precision and complexity |
+| `docs/MATHEMATICAL_INVARIANTS.md` | Operator contracts |
+| `docs/PERFORMANCE.md` | Measured execution results and reproduction instructions |
+| `docs/benchmarks/` | Machine-readable benchmark results |
+| `docs/EXPERIMENTS.md` | Controlled research evaluation |
+| `configs/` | First-stage and second-stage experiment settings |
+| `examples/` | Forward pass, predictive loss and cached decoding |
+| `scripts/` | Repository checks, memory estimates and execution benchmarks |
 
 ## Quick start
 
@@ -312,6 +284,14 @@ python examples/minimal_forward.py
 python examples/predictive_loss.py
 ```
 
+### Run cached decoding and benchmarks
+
+```bash
+python examples/cached_decode.py
+python scripts/benchmark.py
+python scripts/benchmark_recurrent.py
+```
+
 ## Minimal Python example
 
 ```python
@@ -341,6 +321,38 @@ print(out.logits.shape)
 print(len(out.predictive))
 print(out.predictive[0].params.means.shape)
 ```
+
+## Cached generation and packed documents
+
+Prefill once, then carry both state lists into each continuation:
+
+```python
+model.eval()
+with torch.inference_mode():
+    out = model(tokens, use_cache=True, logits_to_keep=1, return_predictive=False)
+    next_token = out.logits[:, -1].argmax(-1, keepdim=True)
+    out = model(
+        next_token,
+        recurrent_states=out.recurrent_states,
+        attention_states=out.attention_states,
+        use_cache=True,
+        logits_to_keep=1,
+        return_predictive=False,
+    )
+```
+
+`reset_mask[b, t] = True` begins a document before token `t` at every layer.
+Attention excludes earlier documents and rotary positions restart at zero.
+The cache retains grouped K/V heads and supports single-token or multi-token
+chunks. `logits_to_keep=1` projects only the final hidden state to the vocabulary.
+`return_predictive=False` omits returned diagnostics while retaining predictive
+feedback in the model computation.
+
+On the recorded CPU workload, batched recurrent projections execute 5.97x faster
+than token-by-token calls, recurrent forward/backward executes 3.95x faster, and
+cached decoding including prefill executes 5.69x faster than full-prefix
+recomputation. [Benchmark conditions and raw results](docs/PERFORMANCE.md) specify
+the tested shapes, timing dispersion, numerical errors and scope.
 
 ## Training sequence
 
@@ -398,14 +410,17 @@ AELIA is evaluated on both language-model quality and the quality of its interna
 Implemented and tested here:
 
 - contractive delta-rule recurrent memory;
-- grouped-query causal attention with RoPE;
+- batched recurrent projections with exact state and gradient semantics;
+- grouped-query causal attention with document-local RoPE and K/V caches;
+- packed-document isolation across recurrent, predictive and attention layers;
 - SwiGLU residual blocks;
 - diagonal Gaussian-mixture prediction;
 - diagonal-plus-low-rank Gaussian likelihood;
 - Woodbury inverse and determinant path;
 - posterior responsibilities;
+- exact log-space mixture routing and partially observed Gaussian marginals;
 - characteristic-function embedding;
-- low-order distributional moments;
+- covariance-aware projected moments;
 - gradient-scaled predictive feedback;
 - Hellinger CountSketch;
 - multiscale future-observation projection;
@@ -422,7 +437,6 @@ Research-scale systems work still required for large models:
 - fused recurrent scan kernels;
 - tensor/sequence/context parallelism;
 - distributed teacher-target generation;
-- packed-document exact attention masking;
 - cached branch-continuation pipeline;
 - FP8 kernel validation;
 - distributed whitening calibration;
@@ -445,9 +459,14 @@ The detailed status is tracked in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEME
 
 The test suite checks more than tensor shapes. It validates properties that the architecture depends on:
 
-- document resets remove recurrent history;
+- document resets isolate every layer;
+- cached and full-prefix logits agree;
+- batched and tokenwise recurrent outputs, states and gradients agree;
 - mixture weights and responsibilities normalize;
 - the Woodbury likelihood matches dense Gaussian evaluation;
+- partial-target likelihoods and gradients match dense Gaussian marginals;
+- degenerate low-rank orientations have finite gradients;
+- probability arithmetic preserves FP32 and FP64 precision;
 - characteristic feedback is invariant to mode permutation;
 - identical-component splitting leaves the characteristic representation unchanged;
 - zero feedback-gradient scale prevents LM feedback from modifying density parameters;
@@ -473,6 +492,8 @@ The YAML files describe experimental intent. The `ModelConfig` dataclass is the 
 
 - **[Full mathematical and systems specification](docs/SPECIFICATION.md)**
 - **[Mathematical invariants](docs/MATHEMATICAL_INVARIANTS.md)**
+- **[Execution mathematics](docs/EXECUTION_MATH.md)**
+- **[Performance measurements](docs/PERFORMANCE.md)**
 - **[Experimental protocol](docs/EXPERIMENTS.md)**
 - **[Implementation status](docs/IMPLEMENTATION_STATUS.md)**
 
@@ -483,24 +504,3 @@ If you build on the architecture or reference implementation, use the included [
 ## License
 
 Apache License 2.0. See [`LICENSE`](LICENSE).
-
-
-### Numerical execution
-
-Predictive uncertainty uses exact projected mixture covariance, including
-low-rank and between-mode correlations. Gaussian density evaluation uses
-a Cholesky solve and a nonnegative residual quadratic in at least float32.
-The recurrent operator batches independent projections across time while
-retaining causal state updates and document resets.
-
-The derivations and complexity bounds are in
-[Mathematical invariants](docs/MATHEMATICAL_INVARIANTS.md).
-Run the reproducible recurrent CPU benchmark with:
-
-```bash
-PYTHONPATH=src python scripts/benchmark_recurrent.py
-```
-
-The benchmark checks output and state agreement before timing. Its ratio
-measures one recurrent operator in inference mode; end-to-end training
-speed, GPU throughput and language-model quality require separate measurements.

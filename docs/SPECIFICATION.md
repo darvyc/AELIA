@@ -234,6 +234,8 @@ S_t = (I - beta_t k_t k_t^T) D_t S\_(t-1) + beta_t k_t v_target,t^T
 
 - Per-layer memory residual strength is initialized near zero or at a depth-scaled value and is monitored by residual-ratio diagnostics.
 
+Token-local normalization, input projections, output projection and gating are batched across time. The memory transition and read follow the exact sequential recurrence. A reset explicitly discards the preceding state. Persistent memory is independent of context length; training retains scan activations for differentiation. The executable key and query normalization divides by max(norm, epsilon), ensuring norms at most one.
+
 # 7. Exact causal attention
 
 Exact-access layers use grouped-query causal attention with rotary position encoding. These layers preserve high-fidelity token-to-token retrieval for events that are inefficient to compress into recurrent state.
@@ -245,6 +247,10 @@ A_h = softmax(Q_h K_h^T / sqrt(d_h) + M_causal)
 O = Concat_h(A_h V_h) W_O
 
 h = x + alpha_attn,l O
+
+For cached prefix length P, query i attends key j only when j <= P+i and both have the same document ID. A reset begins a document before its token and restarts rotary positions at zero. K/V caches retain grouped heads and carry document and position metadata. Cached multi-token chunks use an explicit offset causal mask. Every attention layer receives the same reset mask as recurrent layers.
+
+In evaluation mode with fixed weights, complete hybrid caches reproduce full-prefix logits within floating-point tolerance. Carry both recurrent and attention state lists when continuing the model. Suffix-only vocabulary projection uses logits_to_keep=1 for the next-token distribution.
 
 # 8. Channel transformation
 
@@ -418,61 +424,56 @@ sigma_min^2 I \<= D\_(t,m) \<= sigma_max^2 I
 
 # 18. Low-rank covariance geometry
 
-When enabled, structured covariance adds a context-dependent low-rank positive-semidefinite term. A bank of global basis matrices spans a broad uncertainty subspace, while context-dependent mixing and orthonormalization generate token- and mode-specific directions. This avoids confining all correlated uncertainty to one fixed low-dimensional subspace.
+Structured covariance uses a fixed orthonormal basis B0 of shape [D_z, s] and a learned orientation C of shape [s, r]. The executable configuration enforces 1 <= r <= s <= D_z. Correlated uncertainty lies in the span of B0; a full-dimensional basis permits the full target space.
 
-V\_(t,m) = sum\_(g=1)^G a\_(t,m,g) B_g C\_(t,m,g)
+```text
+G = C^T C
+eta = epsilon_Q * (1 + trace(G) / r)
+L L^T = G + eta I
+Q = C L^(-T)
+lambda_j = lambda_max sigmoid(a_lambda,j)
+U = B0 Q Diag(sqrt(lambda))
+Sigma = D + U U^T
 
-a\_(t,m,:) = softmax(W_B f\_(t,m))
+Q^T Q = I - eta L^(-1) L^(-T) <= I
+lambda_min(Sigma) >= sigma_min^2
+lambda_max(Sigma) <= sigma_max^2 + lambda_max
+kappa(Sigma) <= (sigma_max^2 + lambda_max) / sigma_min^2
+```
 
-Q\_(t,m) = V\_(t,m) \[ V\_(t,m)^T V\_(t,m) + epsilon_Q I \]^(-1/2)
+Triangular solves form Q without an explicit inverse or eigenvector derivatives. The positive relative regularizer supports zero and rank-deficient orientations. Square-root strengths use sqrt(lambda_max) exp(0.5 logsigmoid(a_lambda)) to retain finite gradients at numerical saturation.
 
-lambda\_(t,m,j) = lambda_max sigmoid(a_lambda\_(t,m,j))
-
-U\_(t,m) = Q\_(t,m) Diag(sqrt(lambda\_(t,m)))
-
-Sigma\_(t,m) = D\_(t,m) + U\_(t,m) U\_(t,m)^T
-
-lambda_min(Sigma\_(t,m)) \>= sigma_min^2
-
-lambda_max(Sigma\_(t,m)) \<= sigma_max^2 + lambda_max
-
-kappa(Sigma\_(t,m)) \<= (sigma_max^2 + lambda_max) / sigma_min^2
-
-- Basis-bank rank is chosen so that the concatenated basis span covers the target space as broadly as the compute budget permits.
-
-- Low-rank strengths begin near zero.
-
-- A temporary variance anchor discourages early saturation at covariance bounds.
+A basis-bank experiment may mix several global subspaces. Any such operator must preserve the same spectral bound and earn its parameter and execution cost under the matched controls.
 
 # 19. Gaussian-mixture likelihood
 
-For each component, inverse and log determinant are evaluated through the Woodbury identity and matrix determinant lemma. Only the r_cov by r_cov inner matrix requires dense factorization. All numerically sensitive operations use FP32.
+Each Gaussian likelihood is evaluated with a diagonal-plus-low-rank factorization. Only the r by r inner matrix requires dense factorization. Probability-critical arithmetic uses FP32 for FP16/BF16/FP32 inputs and preserves FP64 reference inputs.
 
+```text
 Sigma = D + U U^T
-
 M = I + U^T D^(-1) U
-
 Sigma^(-1) = D^(-1) - D^(-1) U M^(-1) U^T D^(-1)
 
 delta = Zhat_t - mu_m
+b = D^(-1/2) delta
+V = D^(-1/2) U
+a = V^T b
+w = solve(M, a)
+Q_m = ||b - V w||_2^2 + ||w||_2^2
+    = b^T b - a^T solve(M, a)
 
-a = U^T D^(-1) delta
-
-Q_m = delta^T D^(-1) delta - a^T M^(-1) a
-
-logdet(Sigma_m) = sum_j log(sigma\_(m,j)^2) + logdet(M)
-
-log p_m = -0.5 \[ D_z log(2\*pi) + logdet(Sigma_m) + Q_m \]
-
-ell_m = log(pi_m + epsilon_pi) + log p_m
-
+logdet(Sigma_m) = sum_j log(d_m,j) + 2 sum_j log(cholesky(M)_jj)
+log p_m = -0.5 * (D_z log(2*pi) + logdet(Sigma_m) + Q_m)
+log_pi = log_softmax(a_pi / tau_pi)
+ell_m = log_pi_m + log p_m
 L_pred,t = -(1/D_z) logsumexp_m(ell_m)
+```
 
-- For diagonal covariance, set U=0 and M=I.
+The sum-of-squares quadratic avoids cancellation between large Woodbury terms. M already contains an identity term and is factored directly. Router log probabilities are retained before exponentiation, and manually supplied zero weights have exactly zero density and posterior mass.
 
-- For partially valid target dimensions I_t, evaluate the Gaussian marginal using mu\_\[I_t\] and Sigma\_\[I_t,I_t\].
+For observed target coordinates I_t, evaluate the exact marginal using mu[I_t], d[I_t], and U[I_t, :]. Replace D_z in the Gaussian constant and loss normalization with the observed coordinate count. Unobserved rows contribute no determinant or quadratic terms; masking precedes arithmetic, so missing target entries may be NaN. Prefixes with no observed coordinates have unit marginal density, zero training weight, and zero gradient. The minibatch objective averages the normalized losses of observed prefixes.
 
-- Cholesky factors receive epsilon_chol I before factorization.
+The observation mask refers to the frozen density coordinates. A dense transform that mixes missing raw features requires an explicit observation model or valid block construction before coordinate marginalization.
 
 # 20. Posterior responsibilities and router training
 
@@ -482,7 +483,7 @@ pi\_(t,m) = softmax_m(a_pi,t / tau_pi)
 
 r\_(t,m) = exp(ell_m) / sum_j exp(ell_j)
 
-d L_pred,t / d a_pi,m = (pi_m - r_m) / D_z
+d L_pred,t / d a_pi,m = (pi_m - r_m) / (tau_pi D_z)
 
 r_bar_m = (1/N) sum_t r\_(t,m)
 
@@ -550,25 +551,28 @@ L_CF,t = (1/J) sum_j w_j \[ (Re_q-Re_P)^2 + (Im_q-Im_P)^2 \]
 
 # 24. Distribution-invariant feedback embedding
 
-The predictive residual receives a representation of the probability distribution itself. Characteristic features and distributional moments are invariant to mixture-component permutation, duplication into identical weighted subcomponents, merging of identical subcomponents, and any exact reparameterization that preserves q.
+The predictive residual receives characteristic features and moments of the probability law. These quantities are invariant to component permutation, exact splitting into weighted identical copies, and merging of identical copies.
 
-For fixed frequencies omega_j, the Gaussian characteristic function is analytic. The diagonal-plus-low-rank covariance permits efficient computation of omega^T Sigma omega.
-
-theta\_(j,m) = omega_j^T mu_m
-
-v\_(j,m) = sum_k sigma\_(m,k)^2 omega\_(j,k)^2 + \|\|U_m^T omega_j\|\|\_2^2
-
-Re phi_q(omega_j) = sum_m pi_m exp(-0.5 v\_(j,m)) cos(theta\_(j,m))
-
-Im phi_q(omega_j) = sum_m pi_m exp(-0.5 v\_(j,m)) sin(theta\_(j,m))
+```text
+theta_(j,m) = omega_j^T mu_m
+v_(j,m) = sum_d d_m,d omega_j,d^2 + ||U_m^T omega_j||_2^2
+Re phi_q(omega_j) = sum_m pi_m exp(-0.5 v_(j,m)) cos(theta_(j,m))
+Im phi_q(omega_j) = sum_m pi_m exp(-0.5 v_(j,m)) sin(theta_(j,m))
 
 mu_bar = sum_m pi_m mu_m
+C_total = sum_m pi_m [Sigma_m + (mu_m-mu_bar)(mu_m-mu_bar)^T]
+mean_j = sum_m pi_m p_j^T mu_m
+var_j = sum_m pi_m [sum_d p_j,d^2 d_m,d + ||U_m^T p_j||_2^2
+                   + (p_j^T mu_m - mean_j)^2]
 
-C_total = sum_m pi_m \[Sigma_m + mu_m mu_m^T\] - mu_bar mu_bar^T
+d_diag = (sum_d C_total,dd)^2 / (sum_d C_total,dd^2 + epsilon)
+b_t = Concat(Re phi_q, Im phi_q, mean_projection, variance_projection,
+             tr(C_total)/D_z, d_diag)
+```
 
-G_total = P_C C_total P_C^T
+The executable summary has 2 J + 2 J_projection + 2 coordinates. Projected marginal variances include within-component and between-component correlations without constructing a D_z by D_z matrix. Centered moment formulas avoid large raw-second-moment subtraction.
 
-b_t = Concat(Re phi_q(omega_1), Im phi_q(omega_1), ..., P_mu mu_bar, vech(G_total), tr(C_total)/D_z, D_eff)
+The diagonal participation ratio d_diag measures dispersion in the fixed coordinate system. The spectral effective dimension D_eff in the diagnostics section uses trace(C_total^2), including off-diagonal entries. A full projected covariance summary may use vech(P_C C_total P_C^T) when its wider feedback interface is explicitly budgeted.
 
 # 25. Finite characteristic-feature approximation
 
@@ -754,17 +758,17 @@ lambda_c \<- max(0, lambda_c + eta_lambda(mean_batch(C_pred)-B_pred))
 
 # 35. Numerical precision and stability
 
-AELIA separates throughput-oriented matrix precision from probability-critical arithmetic. Covariance bounds, Cholesky jitter, shrinkage whitening, normalized keys, and residual scaling jointly define the numerical stability envelope.
+AELIA separates throughput-oriented matrix precision from probability-critical arithmetic. Covariance bounds, regularized orientation factors, frozen whitening, normalized keys, and bounded residual strengths define its numerical envelope.
 
-- BF16 or validated FP8: large backbone matrix multiplications.
+- BF16 or validated FP8 can execute large backbone matrix multiplications.
+- RMSNorm accumulates squared magnitudes in FP32, preserving FP64 reference inputs, then returns the input dtype.
+- Recurrent states, normalized queries/keys, decay gates, and memory transitions accumulate in FP32 or FP64.
+- Mixture parameter projections, log probabilities, covariance arithmetic, Cholesky factors, Gaussian marginals, characteristic functions, and projected moments use FP32 or FP64 with autocast disabled.
+- Orientation regularization is eta = epsilon_Q (1 + trace(C^T C)/r). The likelihood matrix I + U^T D^(-1) U is factored directly to preserve its exact determinant and quadratic.
+- Global gradient norm is clipped to g_max, typically 1, by the training harness.
+- Variance floors, ceilings, and low-rank strengths are selected in frozen whitened coordinates and monitored for saturation.
 
-- FP32: mixture logits, variance logits, low-rank strengths, Woodbury inner matrices, Cholesky factors, log determinants, Mahalanobis forms, log-sum-exp, responsibilities, entmax thresholds, characteristic phases, whitening calibration, and calibration diagnostics.
-
-- Cholesky uses M \<- M + epsilon_chol I with epsilon_chol typically 1e-5 to 1e-4.
-
-- Global gradient norm is clipped to g_max, typically 1.
-
-- Variance floor sigma_min and ceiling sigma_max are selected in whitened coordinates and logged with saturation fractions.
+Zero mean vectors, zero or rank-deficient orientations, saturated strengths, absent mixture modes, and unobserved targets have focused finite-gradient tests. Full equations and numerical reference contracts are given in [Execution mathematics](EXECUTION_MATH.md).
 
 # 36. Complete training objective
 
@@ -841,9 +845,11 @@ n_mode_out = 2 D_z + r_0 r_cov + r_cov
 
 C_mode_head approx 2 d_f n_mode_out
 
-C_likelihood = O(D_z r_cov + r_cov^3)
+C_likelihood,per_component = O(D_z r_cov^2 + r_cov^3)
 
-C_characteristic = O(J(D_z+r_cov))
+C_characteristic,per_component = O(J D_z (1 + r_cov))
+
+Multiply these costs by K components, the number of prefixes, and predictive layers. The diagonal likelihood has O(D_z) cost per component.
 
 - Measured hardware counters take precedence over analytic FLOP estimates when both are available.
 
@@ -857,13 +863,15 @@ Recurrent state is constant in context length, while exact-attention KV state gr
 
 M_rec,values = (L_R+L_P) H d_k d_v
 
-M_rec,bytes = M_rec,values b
+M_rec,bytes = M_rec,values b_rec
 
-M_KV,token = 2 L_A H_KV d_h b
+M_KV,token = 2 L_A H_KV d_h b_kv
 
 M_total(T) approx M_rec,bytes + T M_KV,token + M_other
 
 T_cross = M_rec,bytes / M_KV,token
+
+These expressions are per sequence. Multiply by batch size for a batch. The implementation uses b_rec=4 for FP16/BF16/FP32 inputs and b_rec=8 for FP64 inputs. K/V follows the projection dtype. Cache metadata and temporary head repetition are additional allocations.
 
 # 41. Statistical evaluation
 
@@ -1076,7 +1084,7 @@ R(AELIA_feedback;C,P) \< R(AELIA_no_feedback;C,P)
 | Predictive context  | W_c, W_g, W_u, A_g, A_u, e_m                        | Shared mode network                               |
 | Means               | W_base, W_mu                                        | Optional RMS mean bound                           |
 | Diagonal covariance | W_sigma, b_sigma                                    | sigma_min^2 \<= sigma^2 \<= sigma_max^2           |
-| Low-rank covariance | basis bank B_g, W_B, C heads, W_lambda              | PSD addition; bounded strengths                   |
+| Low-rank covariance | fixed B0, orientation C heads, W_lambda              | PSD addition; bounded strengths                   |
 | Router              | W_pi, b_pi, tau_pi                                  | Dense softmax first; sparse later                 |
 | Feedback            | fixed omega_j, P_mu, P_C, W_pred, gate              | Distribution-invariant inputs; depth-scaled gamma |
 | MTP                 | A_h, B_h, shared E_out                              | Training-only auxiliary heads                     |

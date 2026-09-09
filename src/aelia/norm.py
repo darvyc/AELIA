@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from .numerics import probability_dtype
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
@@ -11,5 +13,6 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return self.weight * x / rms
+        value = x.to(probability_dtype(x))
+        normalized = value * value.square().mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return self.weight.to(x.dtype) * normalized.to(x.dtype)

@@ -1,5 +1,6 @@
 """AELIA: Adaptive Ellipsoidal Latent Inference Architecture."""
 
+from .attention import AttentionState
 from .config import AttentionConfig, MemoryConfig, ModelConfig, PredictiveConfig
 from .controls import SameSupervisionDeterministicControl
 from .future_features import FutureObservationAssembler, MultiscaleFutureProjector
@@ -15,6 +16,7 @@ __all__ = [
     "PredictiveConfig",
     "MemoryConfig",
     "AttentionConfig",
+    "AttentionState",
     "GaussianMixturePredictor",
     "MixtureParams",
     "ContractiveDeltaMemory",
@@ -27,4 +29,3 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
-

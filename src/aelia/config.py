@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -20,6 +21,8 @@ class MemoryConfig:
             raise ValueError("d_key and d_value must be positive")
         if not 0.0 < self.alpha_max < 1.0:
             raise ValueError("alpha_max must be strictly between 0 and 1")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError("eps must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -43,17 +46,27 @@ class PredictiveConfig:
     eps: float = 1e-6
 
     def validate(self) -> None:
+        if min(self.d_model, self.context_dim, self.feature_dim, self.mode_dim) < 1:
+            raise ValueError("model and feature dimensions must be positive")
         if self.modes < 1:
             raise ValueError("modes must be at least 1")
         if self.target_dim < 1:
             raise ValueError("target_dim must be positive")
         if self.covariance not in {"diagonal", "diag_lowrank"}:
             raise ValueError("covariance must be 'diagonal' or 'diag_lowrank'")
-        if not 0.0 < self.sigma_min < self.sigma_max:
+        if not 0.0 < self.sigma_min < self.sigma_max or not math.isfinite(self.sigma_max):
             raise ValueError("Require 0 < sigma_min < sigma_max")
         if self.covariance == "diag_lowrank":
-            if self.cov_rank < 1 or self.basis_rank < self.cov_rank:
-                raise ValueError("Require basis_rank >= cov_rank >= 1")
+            if not 1 <= self.cov_rank <= self.basis_rank <= self.target_dim:
+                raise ValueError("Require target_dim >= basis_rank >= cov_rank >= 1")
+        if not math.isfinite(self.lambda_max) or self.lambda_max < 0:
+            raise ValueError("lambda_max must be finite and nonnegative")
+        for name in ("mixture_temperature", "characteristic_scale", "eps"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.mean_rms_max is not None and (not math.isfinite(self.mean_rms_max) or self.mean_rms_max <= 0):
+            raise ValueError("mean_rms_max must be finite and positive, or None")
         if self.characteristic_features < 1:
             raise ValueError("characteristic_features must be positive")
 
@@ -68,10 +81,16 @@ class AttentionConfig:
     dropout: float = 0.0
 
     def validate(self) -> None:
+        if min(self.d_model, self.query_heads, self.kv_heads, self.head_dim) < 1:
+            raise ValueError("attention dimensions must be positive")
         if self.query_heads % self.kv_heads != 0:
             raise ValueError("query_heads must be divisible by kv_heads")
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        if not math.isfinite(self.rope_base) or self.rope_base <= 0:
+            raise ValueError("rope_base must be finite and positive")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -105,10 +124,15 @@ class ModelConfig:
         invalid = [x for x in self.layers if x not in {"R", "P", "A"}]
         if invalid:
             raise ValueError(f"invalid layer classes: {invalid}")
-        if self.ffn_multiplier <= 0:
+        if self.d_model < 1:
+            raise ValueError("d_model must be positive")
+        if (
+            not math.isfinite(self.ffn_multiplier)
+            or self.ffn_multiplier <= 0
+            or int(self.ffn_multiplier * self.d_model) < 1
+        ):
             raise ValueError("ffn_multiplier must be positive")
 
     @property
     def predictive_layers(self) -> int:
         return sum(x == "P" for x in self.layers)
-

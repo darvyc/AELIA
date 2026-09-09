@@ -1,0 +1,80 @@
+{
+  "environment": {
+    "torch": "2.14.0+cpu",
+    "python": "3.12.14",
+    "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+    "device": "cpu",
+    "threads": 1,
+    "dtype": "float32",
+    "seed": 1729,
+    "processor": "AMD EPYC 9V74 80-Core Processor"
+  },
+  "recurrent": {
+    "shape": [
+      2,
+      128,
+      128
+    ],
+    "heads": 4,
+    "d_key": 16,
+    "d_value": 16,
+    "max_output_error": 2.384185791015625e-07,
+    "state_bytes": 8192,
+    "cases": {
+      "forward": {
+        "token_steps": {
+          "median_ms": 19.92847650001295,
+          "iqr_ms": 1.1919309998233985,
+          "measurements": 50
+        },
+        "batched_projections": {
+          "median_ms": 3.3366080001542286,
+          "iqr_ms": 0.25776899997254077,
+          "measurements": 293
+        },
+        "speedup": 5.97267539342104
+      },
+      "forward_backward": {
+        "token_steps": {
+          "median_ms": 87.3558089999733,
+          "iqr_ms": 7.884274500099764,
+          "measurements": 12
+        },
+        "batched_projections": {
+          "median_ms": 22.10383300007379,
+          "iqr_ms": 1.5200929999537038,
+          "measurements": 45
+        },
+        "speedup": 3.9520660963952126
+      }
+    }
+  },
+  "decoding": {
+    "batch": 1,
+    "prompt_tokens": 128,
+    "predicted_positions": 16,
+    "model": {
+      "d_model": 128,
+      "vocab_size": 1024,
+      "layers": [
+        "R",
+        "P",
+        "A",
+        "R"
+      ]
+    },
+    "full_prefix": {
+      "median_ms": 230.1839909998762,
+      "iqr_ms": 9.093582000105016,
+      "measurements": 5
+    },
+    "cached": {
+      "median_ms": 40.421567000066716,
+      "iqr_ms": 4.961447000141561,
+      "measurements": 25
+    },
+    "speedup": 5.694583562272493,
+    "max_logit_error": 3.0517578125e-05,
+    "kv_tensor_bytes": 73216
+  }
+}

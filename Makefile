@@ -7,10 +7,10 @@ test:
 	python -m pytest -q
 
 lint:
-	ruff check src tests examples scripts
+	python -m ruff check src tests examples scripts
 
 format:
-	ruff format src tests examples scripts
+	python -m ruff format src tests examples scripts
 
 check: lint test
 

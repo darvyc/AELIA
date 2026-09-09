@@ -139,10 +139,13 @@ L = -logsumexp_m(ell_m)
 and, for ordinary softmax router logits `a_m`:
 
 ```text
-dL / da_m = pi_m - r_m
+dL / da_m = (pi_m - r_m) / tau
 ```
 
-up to any explicit scalar normalization applied to the loss.
+for `pi = softmax(a / tau)`, up to any explicit scalar normalization applied to
+the loss. The normalized `D`-coordinate objective divides this gradient by `D`.
+Log probabilities are retained directly from `log_softmax`; an exactly absent
+component contributes no probability mass.
 
 ## 6. Characteristic representation invariance
 
@@ -276,3 +279,21 @@ Projected activations require O(B T H (3 D_key + D_value + 1)) storage;
 the recurrent state occupies O(B H D_key D_value). This implementation
 trades projected activation storage for fewer small projection launches.
 It does not implement a parallel scan or a fused GPU recurrence.
+
+## 13. Complete hybrid continuation
+
+For fixed weights in evaluation mode, carrying every recurrent and attention
+state produces the same logits as full-prefix execution, within the numerical
+tolerance. Cached query `i` with prefix length `P` sees key `j` only if
+`j <= P+i` and both belong to the same document. A document reset isolates all
+layer classes and restarts rotary positions.
+
+## 14. Partial Gaussian marginals
+
+For observed coordinates `I`, use `mu[I]`, `diag_var[I]`, and the corresponding
+rows `U[I, :]`. The Gaussian constant uses `|I|`. The empty marginal has unit
+density, and wholly unobserved prefixes contribute zero training weight.
+Unobserved coordinates have zero likelihood gradient.
+
+Proofs, precision rules, complexity, and numerical contracts are in
+[EXECUTION_MATH.md](EXECUTION_MATH.md).

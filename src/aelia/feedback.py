@@ -41,7 +41,9 @@ class DistributionSummary(nn.Module):
         mean_proj, var_proj = self.predictor.projected_moments(params, self.moment_projection)
         u_total = var_diag.mean(dim=-1, keepdim=True)
         d_eff = var_diag.sum(dim=-1, keepdim=True).square() / (var_diag.square().sum(dim=-1, keepdim=True) + 1e-6)
-        return torch.cat([phi.real.to(mean.dtype), phi.imag.to(mean.dtype), mean_proj, var_proj, u_total, d_eff], dim=-1)
+        return torch.cat(
+            [phi.real.to(mean.dtype), phi.imag.to(mean.dtype), mean_proj, var_proj, u_total, d_eff], dim=-1
+        )
 
 
 class PredictiveFeedback(nn.Module):
@@ -64,7 +66,7 @@ class PredictiveFeedback(nn.Module):
 
     def forward(self, h: torch.Tensor, summary: torch.Tensor) -> torch.Tensor:
         summary = gradient_scale(summary, self.gradient_scale_value)
-        d = self.proj(self.summary_norm(summary))
+        d = self.proj(self.summary_norm(summary).to(h.dtype))
         gate = torch.sigmoid(self.gate(self.hidden_norm(h)))
         gamma = self.gamma_max * torch.sigmoid(self.logit_strength)
         return h + gamma * gate * d

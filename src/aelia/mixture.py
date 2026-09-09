@@ -9,6 +9,7 @@ from torch import nn
 
 from .config import PredictiveConfig
 from .norm import RMSNorm
+from .numerics import probability_dtype
 
 
 @dataclass
@@ -17,6 +18,17 @@ class MixtureParams:
     means: torch.Tensor
     diag_var: torch.Tensor
     lowrank: torch.Tensor | None = None
+    log_weights: torch.Tensor | None = None
+
+
+def mixture_log_weights(params: MixtureParams) -> torch.Tensor:
+    """Use router log probabilities; exact zero weights have log mass -inf."""
+    if params.log_weights is not None:
+        return params.log_weights.to(probability_dtype(params.log_weights))
+    weights = params.weights.to(probability_dtype(params.weights))
+    positive = weights > 0
+    # Mask before log so an absent component also has a finite zero gradient.
+    return torch.where(positive, weights, torch.ones_like(weights)).log().masked_fill(~positive, -torch.inf)
 
 
 class GaussianMixturePredictor(nn.Module):
@@ -72,116 +84,159 @@ class GaussianMixturePredictor(nn.Module):
     def forward(self, h: torch.Tensor) -> MixtureParams:
         cfg = self.config
         c, f = self._features(h)
-        logits = self.router(c) / cfg.mixture_temperature
-        weights = torch.softmax(logits.float(), dim=-1).to(h.dtype)
-        means = self.base_mean(c).unsqueeze(-2) + self.mean(f)
-        if cfg.mean_rms_max is not None:
-            rms = means.pow(2).mean(dim=-1, keepdim=True).sqrt()
-            means = means / torch.sqrt(1.0 + (rms / cfg.mean_rms_max).pow(2))
-        sigma2 = cfg.sigma_min**2 + (cfg.sigma_max**2 - cfg.sigma_min**2) * torch.sigmoid(self.logit_sigma(f))
+        dtype = probability_dtype(h)
+        # The shared feature network may use autocast. Probability parameter
+        # projections and all covariance arithmetic retain FP32 or FP64.
+        with torch.autocast(device_type=h.device.type, enabled=False):
 
-        lowrank = None
-        if cfg.covariance == "diag_lowrank":
-            assert self.orientation is not None and self.strength is not None
-            raw_c = self.orientation(f).view(*f.shape[:-1], cfg.basis_rank, cfg.cov_rank)
-            gram = raw_c.transpose(-1, -2) @ raw_c
-            eye = torch.eye(cfg.cov_rank, device=h.device, dtype=h.dtype)
-            evals, evecs = torch.linalg.eigh(gram + cfg.eps * eye)
-            inv_sqrt = evecs @ torch.diag_embed(evals.clamp_min(cfg.eps).rsqrt()) @ evecs.transpose(-1, -2)
-            q = raw_c @ inv_sqrt
-            directions = torch.einsum("dr,...rk->...dk", self.basis.to(h.dtype), q)
-            lam = cfg.lambda_max * torch.sigmoid(self.strength(f))
-            lowrank = directions * lam.sqrt().unsqueeze(-2)
-        return MixtureParams(weights=weights, means=means, diag_var=sigma2, lowrank=lowrank)
+            def project(layer, value):
+                bias = None if layer.bias is None else layer.bias.to(dtype)
+                return F.linear(value.to(dtype), layer.weight.to(dtype), bias)
 
-    def component_log_prob(self, z: torch.Tensor, params: MixtureParams) -> torch.Tensor:
-        """Return component log densities with shape [..., K]."""
-        # Density algebra accumulates in at least float32, including under AMP.
-        dtype = torch.promote_types(z.dtype, params.means.dtype)
-        dtype = torch.promote_types(dtype, params.diag_var.dtype)
-        if params.lowrank is not None:
-            dtype = torch.promote_types(dtype, params.lowrank.dtype)
-        if dtype in (torch.float16, torch.bfloat16):
-            dtype = torch.float32
+            logits = project(self.router, c) / cfg.mixture_temperature
+            log_weights = F.log_softmax(logits, dim=-1)
+            means = project(self.base_mean, c).unsqueeze(-2) + project(self.mean, f)
+            if cfg.mean_rms_max is not None:
+                means = means * (1.0 + means.square().mean(dim=-1, keepdim=True) / cfg.mean_rms_max**2).rsqrt()
+            sigma2 = cfg.sigma_min**2 + (cfg.sigma_max**2 - cfg.sigma_min**2) * torch.sigmoid(
+                project(self.logit_sigma, f)
+            )
+
+            lowrank = None
+            if cfg.covariance == "diag_lowrank":
+                assert self.orientation is not None and self.strength is not None
+                raw_c = project(self.orientation, f).view(*f.shape[:-1], cfg.basis_rank, cfg.cov_rank)
+                gram = raw_c.transpose(-1, -2) @ raw_c
+                eye = torch.eye(cfg.cov_rank, device=h.device, dtype=dtype)
+                jitter = cfg.eps * (1.0 + gram.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True))
+                chol = torch.linalg.cholesky(gram + jitter.unsqueeze(-1) * eye)
+                q = torch.linalg.solve_triangular(chol, raw_c.transpose(-1, -2), upper=False).transpose(-1, -2)
+                directions = self.basis.to(dtype) @ q
+                # exp(logsigmoid / 2) is finite even when a strength saturates.
+                root_lam = math.sqrt(cfg.lambda_max) * torch.exp(0.5 * F.logsigmoid(project(self.strength, f)))
+                lowrank = directions * root_lam.unsqueeze(-2)
+        return MixtureParams(log_weights.exp(), means, sigma2, lowrank, log_weights)
+
+    def component_log_prob(
+        self, z: torch.Tensor, params: MixtureParams, observed_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Component log densities [..., K], marginalizing unobserved coordinates.
+
+        ``observed_mask`` is boolean and broadcasts to z. Missing values may be
+        NaN: they are removed before arithmetic and receive zero gradient.
+        """
+        cfg = self.config
+        if z.shape[-1] != cfg.target_dim or params.means.shape[-1] != cfg.target_dim:
+            raise ValueError("observation and means must end in target_dim")
+        dtype = probability_dtype(z, params.means, params.diag_var, params.lowrank)
         with torch.autocast(device_type=z.device.type, enabled=False):
-            delta = z.to(dtype).unsqueeze(-2) - params.means.to(dtype)
-            diag = params.diag_var.to(dtype)
+            observed = z.to(dtype).unsqueeze(-2)
+            means, diag = params.means.to(dtype), params.diag_var.to(dtype)
+            u = None if params.lowrank is None else params.lowrank.to(dtype)
+            dimensions = cfg.target_dim
+            if observed_mask is not None:
+                if observed_mask.dtype != torch.bool:
+                    raise ValueError("observed_mask must be boolean")
+                mask = torch.broadcast_to(observed_mask, z.shape).unsqueeze(-2)
+                dimensions = mask.sum(dim=-1).to(dtype)
+                observed = observed.masked_fill(~mask, 0.0)
+                means = means.masked_fill(~mask, 0.0)
+                diag = diag.masked_fill(~mask, 1.0)
+                if u is not None:
+                    u = u.masked_fill(~mask.unsqueeze(-1), 0.0)
+            delta = observed - means
+            inv_std = diag.rsqrt()
+            b = delta * inv_std
             logdet = diag.log().sum(dim=-1)
-            if params.lowrank is None:
-                quad = (delta.square() / diag).sum(dim=-1)
+            if u is None:
+                quad = b.square().sum(dim=-1)
             else:
-                u = params.lowrank.to(dtype)
-                weighted_u = u / diag.unsqueeze(-1)
-                eye = torch.eye(u.shape[-1], device=z.device, dtype=dtype)
-                m = eye + u.transpose(-1, -2) @ weighted_u
-                a = torch.einsum("...dr,...d->...r", weighted_u, delta)
+                v = inv_std.unsqueeze(-1) * u
+                m = v.transpose(-1, -2) @ v
+                m = m + torch.eye(u.shape[-1], device=z.device, dtype=dtype)
                 chol = torch.linalg.cholesky(m)
-                solution = torch.cholesky_solve(a.unsqueeze(-1), chol).squeeze(-1)
-                # Equivalent to Woodbury without subtracting two large quadratics.
-                residual = delta - (u @ solution.unsqueeze(-1)).squeeze(-1)
-                quad = (residual.square() / diag).sum(dim=-1) + solution.square().sum(dim=-1)
-                logdet = logdet + 2.0 * torch.diagonal(chol, dim1=-2, dim2=-1).log().sum(dim=-1)
-            constant = self.config.target_dim * math.log(2.0 * math.pi)
-            return -0.5 * (constant + logdet + quad)
+                a = v.transpose(-1, -2) @ b.unsqueeze(-1)
+                solved = torch.cholesky_solve(a, chol)
+                # Equivalent to b^T b - a^T M^-1 a, without subtracting two
+                # potentially large, nearly equal positive numbers.
+                residual = b - (v @ solved).squeeze(-1)
+                quad = residual.square().sum(dim=-1) + solved.squeeze(-1).square().sum(dim=-1)
+                logdet = logdet + 2.0 * chol.diagonal(dim1=-2, dim2=-1).log().sum(dim=-1)
+            return -0.5 * (dimensions * math.log(2.0 * math.pi) + logdet + quad)
 
-    def log_prob(self, z: torch.Tensor, params: MixtureParams | None = None) -> torch.Tensor:
+    def log_prob(
+        self, z: torch.Tensor, params: MixtureParams | None = None, observed_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if params is None:
             raise ValueError("params are required; call predictor(h) first")
-        comp = self.component_log_prob(z, params)
-        weighted = torch.log(params.weights.clamp_min(self.config.eps)) + comp
-        return torch.logsumexp(weighted, dim=-1)
+        comp = self.component_log_prob(z, params, observed_mask)
+        return torch.logsumexp(mixture_log_weights(params) + comp, dim=-1)
 
-    def nll(self, z: torch.Tensor, params: MixtureParams, normalize_dim: bool = True) -> torch.Tensor:
-        loss = -self.log_prob(z, params)
+    def nll(
+        self,
+        z: torch.Tensor,
+        params: MixtureParams,
+        normalize_dim: bool = True,
+        observed_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        loss = -self.log_prob(z, params, observed_mask)
+        if observed_mask is not None:
+            counts = torch.broadcast_to(observed_mask, z.shape).sum(dim=-1)
+            counts = torch.broadcast_to(counts, loss.shape)
+            if normalize_dim:
+                loss = loss / counts.clamp_min(1)
+            valid = counts > 0
+            return loss.masked_fill(~valid, 0.0).sum() / valid.sum().clamp_min(1)
         if normalize_dim:
             loss = loss / self.config.target_dim
         return loss.mean()
 
-    def responsibilities(self, z: torch.Tensor, params: MixtureParams) -> torch.Tensor:
-        comp = self.component_log_prob(z, params)
-        ell = torch.log(params.weights.clamp_min(self.config.eps)) + comp
-        return torch.softmax(ell, dim=-1)
+    def responsibilities(
+        self, z: torch.Tensor, params: MixtureParams, observed_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        comp = self.component_log_prob(z, params, observed_mask)
+        return torch.softmax(mixture_log_weights(params) + comp, dim=-1)
 
     def characteristic(self, params: MixtureParams) -> torch.Tensor:
         """Complex-valued characteristic function evaluated at fixed frequencies.
 
         Output shape: [..., J], complex64/complex128.
         """
-        omega = self.omega.to(params.means.dtype)
-        phase = torch.einsum("jd,...kd->...kj", omega, params.means)
-        diag_term = torch.einsum("jd,...kd->...kj", omega.square(), params.diag_var)
-        variance = diag_term
-        if params.lowrank is not None:
-            proj = torch.einsum("jd,...kdr->...kjr", omega, params.lowrank)
-            variance = variance + proj.square().sum(dim=-1)
-        amplitude = torch.exp(-0.5 * variance)
-        real = (params.weights.unsqueeze(-1) * amplitude * torch.cos(phase)).sum(dim=-2)
-        imag = (params.weights.unsqueeze(-1) * amplitude * torch.sin(phase)).sum(dim=-2)
-        return torch.complex(real.float(), imag.float())
+        dtype = probability_dtype(params.means, params.diag_var, params.lowrank, params.weights)
+        with torch.autocast(device_type=params.means.device.type, enabled=False):
+            omega = self.omega.to(dtype)
+            phase = params.means.to(dtype) @ omega.T
+            variance = params.diag_var.to(dtype) @ omega.square().T
+            if params.lowrank is not None:
+                proj = omega @ params.lowrank.to(dtype)
+                variance = variance + proj.square().sum(dim=-1)
+            amplitude = params.weights.to(dtype).unsqueeze(-1) * torch.exp(-0.5 * variance)
+            real = (amplitude * torch.cos(phase)).sum(dim=-2)
+            imag = (amplitude * torch.sin(phase)).sum(dim=-2)
+            return torch.complex(real, imag)
 
     def first_two_moments(self, params: MixtureParams) -> tuple[torch.Tensor, torch.Tensor]:
         """Return mixture mean and diagonal of total covariance."""
-        w = params.weights.unsqueeze(-1)
-        mean = (w * params.means).sum(dim=-2)
-        within_diag = params.diag_var
-        if params.lowrank is not None:
-            within_diag = within_diag + params.lowrank.square().sum(dim=-1)
-        centered = params.means - mean.unsqueeze(-2)
-        total_var_diag = (w * (within_diag + centered.square())).sum(dim=-2)
-        return mean, total_var_diag
+        dtype = probability_dtype(params.means, params.diag_var, params.lowrank, params.weights)
+        with torch.autocast(device_type=params.means.device.type, enabled=False):
+            w, means = params.weights.to(dtype).unsqueeze(-1), params.means.to(dtype)
+            mean = (w * means).sum(dim=-2)
+            within_diag = params.diag_var.to(dtype)
+            if params.lowrank is not None:
+                within_diag = within_diag + params.lowrank.to(dtype).square().sum(dim=-1)
+            total_var_diag = (w * (within_diag + (means - mean.unsqueeze(-2)).square())).sum(dim=-2)
+            return mean, total_var_diag
 
-    def projected_moments(
-        self, params: MixtureParams, projection: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Mean and variance of each row projection, including cross covariance."""
-        p = projection.to(params.means)
-        component_mean = torch.einsum("rd,...kd->...kr", p, params.means)
-        within = torch.einsum("rd,...kd->...kr", p.square(), params.diag_var)
-        if params.lowrank is not None:
-            projected_u = torch.einsum("rd,...kdc->...krc", p, params.lowrank)
-            within = within + projected_u.square().sum(dim=-1)
-        weights = params.weights.unsqueeze(-1)
-        mean = (weights * component_mean).sum(dim=-2)
-        centered = component_mean - mean.unsqueeze(-2)
-        variance = (weights * (within + centered.square())).sum(dim=-2)
-        return mean, variance
+    def projected_moments(self, params: MixtureParams, projection: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mean and exact marginal variances after a linear projection [J, D]."""
+        dtype = probability_dtype(params.means, params.diag_var, params.lowrank, params.weights, projection)
+        with torch.autocast(device_type=params.means.device.type, enabled=False):
+            p = projection.to(dtype)
+            w = params.weights.to(dtype).unsqueeze(-1)
+            component_mean = params.means.to(dtype) @ p.T
+            mean = (w * component_mean).sum(dim=-2)
+            within = params.diag_var.to(dtype) @ p.square().T
+            if params.lowrank is not None:
+                within = within + (p @ params.lowrank.to(dtype)).square().sum(dim=-1)
+            variance = (w * (within + (component_mean - mean.unsqueeze(-2)).square())).sum(dim=-2)
+            return mean, variance

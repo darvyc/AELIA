@@ -14,11 +14,14 @@ def predictive_nll(
     predictor: GaussianMixturePredictor,
     params: MixtureParams,
     target: torch.Tensor,
+    observed_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return predictor.nll(target, params, normalize_dim=True)
+    return predictor.nll(target, params, normalize_dim=True, observed_mask=observed_mask)
 
 
-def characteristic_matching_loss(predicted: torch.Tensor, target_samples: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
+def characteristic_matching_loss(
+    predicted: torch.Tensor, target_samples: torch.Tensor, omega: torch.Tensor
+) -> torch.Tensor:
     """Match predicted characteristic values to an empirical continuation law.
 
     predicted: complex tensor [..., J]
